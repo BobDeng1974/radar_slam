@@ -32,7 +32,7 @@
 #include <tf2_ros/transform_broadcaster.h>
 #include <geometry_msgs/TransformStamped.h>
 #include <tf2_eigen/tf2_eigen.h>
-#include <geometry_msgs/Twist.h>
+#include <geometry_msgs/TwistStamped.h>
 #include <piksi_rtk_msgs/VelNed.h>
 
 class GPSPoseEstimator {
@@ -41,6 +41,11 @@ public:
   GPSPoseEstimator() :
     nh_private_( "~" )
   {
+    // Register the callback for RAC GPS data:
+    sub_gps_data_rac_ = nh_.subscribe( "/vel", 10,
+				       &GPSPoseEstimator::updateGPSDataRAC,
+				       this );
+    
     // Register the callback for piksi GPS data:
     sub_gps_data_piksi_ = nh_.subscribe( "/piksi/vel_ned", 10,
 					 &GPSPoseEstimator::updateGPSDataPiksi,
@@ -50,6 +55,10 @@ public:
     nh_private_.param( "gps_vel_lpf", gps_vel_lpf_, 0.1 );
     nh_private_.param( "integration_rate", integration_rate_, 1000.0 );
     nh_private_.param( "publish_tf", publish_tf_, true );
+    nh_private_.param( "publish_pose_stamped", publish_pose_stamped_, true );
+
+    // Initialize the GPS NED velocity, to be updated from GPS node:
+    gps_vel_ned_.setZero();
     
     // Initialize the pose estimate:
     base_pose_.translation() = Eigen::Vector3d::Zero();
@@ -60,7 +69,7 @@ public:
     ned_to_world_.translation() = Eigen::Vector3d::Zero();
     ned_to_world_.linear() =
       Eigen::AngleAxisd( M_PI, Eigen::Vector3d::UnitY() ).toRotationMatrix();
-
+    
     // Create and launch the pose update thread:
     thread_ = std::unique_ptr<std::thread>( new std::thread( &GPSPoseEstimator::updatePose, this, integration_rate_ ) );
     mutex_.lock();
@@ -77,16 +86,31 @@ public:
 
     thread_->join();
   }
-  
+    
   void updateGPSDataPiksi( const piksi_rtk_msgs::VelNed &msg )
   {
     mutex_.lock();
+
+    // Copy and scale Piksi GPS data (NED frame):
     gps_vel_ned_ = 0.001 * Eigen::Vector3d( static_cast<double>( msg.n ),
 					    static_cast<double>( msg.e ),
 					    static_cast<double>( msg.d ) );
+
     mutex_.unlock();
   }
 
+  void updateGPSDataRAC( const geometry_msgs::TwistStamped &msg )
+  {
+    mutex_.lock();
+    
+    // Convert the RAC message from ENU to NED and check for NaN:
+    gps_vel_ned_.x() = std::isnan( msg.twist.linear.y ) ? 0.0 : msg.twist.linear.y;
+    gps_vel_ned_.y() = std::isnan( msg.twist.linear.x ) ? 0.0 : msg.twist.linear.x;
+    gps_vel_ned_.z() = 0.0;
+
+    mutex_.unlock();
+  }
+  
   void updatePose( double freq )
   {
     // Local variables:
@@ -103,6 +127,9 @@ public:
 
     // Initialize the car velocity publisher:
     pub_car_vel_ = nh_private_.advertise<geometry_msgs::Twist>( "car_vel", 1000 );
+
+    // Initialize the pose publisher:
+    pub_pose_stamped_ = nh_private_.advertise<geometry_msgs::PoseStamped>( "base_link_pose", 1000 );
     
     // Create ROS rate for running at desired frequency:
     ros::Rate update_pose_rate( freq );
@@ -161,7 +188,17 @@ public:
 	  {
 	    bcast_tf_.sendTransform( pose_tf );
 	  }
-	
+
+	// Send the updated base pose message:
+	geometry_msgs::PoseStamped pose;
+	pose.pose = tf2::toMsg( base_pose_ );
+	pose.header.stamp = ros::Time::now();
+	pose.header.frame_id = "map";
+	if( publish_pose_stamped_ )
+	  {
+	    pub_pose_stamped_.publish( pose );
+	  }
+
 	// Publish the car velocity:
 	geometry_msgs::Twist car_vel_msg;
 	tf2::toMsg( vel_world, car_vel_msg.linear );
@@ -187,13 +224,16 @@ private:
   ros::NodeHandle nh_private_;
   
   ros::Subscriber sub_gps_data_piksi_;
+  ros::Subscriber sub_gps_data_rac_;
   Eigen::Vector3d gps_vel_ned_;
   
   double gps_vel_lpf_;
   double integration_rate_;
   bool publish_tf_;
+  bool publish_pose_stamped_;
   
   ros::Publisher pub_car_vel_;
+  ros::Publisher pub_pose_stamped_;
   
   Eigen::Affine3d ned_to_world_;
   Eigen::Affine3d base_pose_;
